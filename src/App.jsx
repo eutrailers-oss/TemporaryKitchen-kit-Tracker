@@ -127,34 +127,70 @@ export default function App() {
     const clean=String(code||'').trim().toUpperCase()
     if(!jobId) throw new Error('Select a job first.')
     if(!clean) throw new Error('Scan or enter an asset code.')
-    const asset=data.assets.find(a=>String(a.code||'').toUpperCase()===clean||String(a.old_code||'').toUpperCase()===clean)
+    const asset=data.assets.find(a=>String(a.id||'').toUpperCase()===clean||String(a.code||'').toUpperCase()===clean||String(a.old_code||'').toUpperCase()===clean)
     if(!asset) throw new Error(`Asset ${clean} was not found.`)
     const job=data.jobs.find(j=>j.id===jobId)
     if(!job) throw new Error('Job was not found.')
-    const row=data.jobAssets.find(x=>x.job_id===jobId&&x.asset_id===asset.id)
+    const rows=data.jobAssets.filter(x=>x.job_id===jobId)
+    const row=rows.find(x=>x.asset_id===asset.id)
+
     if(mode==='load') {
       const other=data.jobAssets.find(x=>x.asset_id===asset.id&&x.job_id!==jobId&&x.out_at&&!x.returned_at)
       if(other){const otherJob=data.jobs.find(j=>j.id===other.job_id);throw new Error(`${asset.code} is already out on ${otherJob?.job_no||'another job'}.`)}
       if(row?.out_at&&!row?.returned_at) throw new Error(`${asset.code} is already loaded on this job.`)
+      if(asset.condition!=='Good'||['In Repair','Lost','Retired'].includes(asset.status)) throw new Error(`${asset.code} is not available to load (${asset.condition||asset.status}).`)
+
+      const plannedRows=rows.filter(r=>!r.out_at||r.returned_at)
+      const exactPlanned=plannedRows.find(r=>r.asset_id===asset.id)
+      const substituteRow=plannedRows.find(r=>{
+        const plannedAsset=data.assets.find(a=>a.id===r.asset_id)
+        return plannedAsset && plannedAsset.category===asset.category
+      })
+      if(!exactPlanned&&!substituteRow){
+        const needed=[...new Set(plannedRows.map(r=>data.assets.find(a=>a.id===r.asset_id)?.category).filter(Boolean))]
+        throw new Error(`${asset.code} is a ${asset.category}. This job still needs: ${needed.join(', ')||'no more equipment'}.`)
+      }
+
       const now=new Date().toISOString()
-      if(row){const {error}=await supabase.from('job_assets').update({out_at:now,returned_at:null,return_condition:null,notes:notes||row.notes||null}).eq('id',row.id);if(error)throw error}
-      else {const {error}=await supabase.from('job_assets').insert({job_id:jobId,asset_id:asset.id,out_at:now,notes:notes||null});if(error)throw error}
+      let changedRow=exactPlanned
+      let substitutedFrom=null
+      if(!exactPlanned&&substituteRow){
+        const oldAsset=data.assets.find(a=>a.id===substituteRow.asset_id)
+        substitutedFrom=oldAsset?.code||'planned asset'
+        const {error}=await supabase.from('job_assets').update({asset_id:asset.id,out_at:now,returned_at:null,return_condition:null,notes:notes||`Substituted for ${substitutedFrom}`}).eq('id',substituteRow.id)
+        if(error) throw error
+        changedRow={...substituteRow,asset_id:asset.id}
+      } else {
+        const {error}=await supabase.from('job_assets').update({out_at:now,returned_at:null,return_condition:null,notes:notes||exactPlanned.notes||null}).eq('id',exactPlanned.id)
+        if(error) throw error
+      }
       const {error:assetError}=await supabase.from('assets').update({status:'On Hire'}).eq('id',asset.id);if(assetError)throw assetError
-      await log(`Loaded ${asset.code} onto ${job.job_no}`,'warehouse')
-      await loadAll(); flash(`${asset.code} loaded`); return asset
+      await log(`${substitutedFrom?`Substituted ${substitutedFrom} with ${asset.code} and loaded`:`Loaded ${asset.code}`} onto ${job.job_no}`,'warehouse')
+      await loadAll(); flash(substitutedFrom?`${asset.code} replaced ${substitutedFrom} and was loaded`:`${asset.code} loaded`)
+      return {asset, substitutedFrom, row:changedRow}
     }
+
     if(!row||!row.out_at||row.returned_at) throw new Error(`${asset.code} is not currently out on this job.`)
     const now=new Date().toISOString()
     const {error}=await supabase.from('job_assets').update({returned_at:now,return_condition:condition,notes:notes||row.notes||null}).eq('id',row.id);if(error)throw error
     const damaged=condition==='Damaged'
-    const {error:assetError}=await supabase.from('assets').update({status:damaged?'Unavailable':'Available',condition:damaged?'Damaged':'Good'}).eq('id',asset.id);if(assetError)throw assetError
+    const {error:assetError}=await supabase.from('assets').update({status:damaged?'In Repair':'Available',condition:damaged?'Damaged':'Good'}).eq('id',asset.id);if(assetError)throw assetError
     if(damaged){const {error:damageError}=await supabase.from('damage_logs').insert({asset_id:asset.id,job_id:jobId,reported_date:isoDate(),reported_by:session?.user?.email||null,severity:'Medium',status:'Open',notes:notes||'Damage recorded during return'});if(damageError)throw damageError}
     await log(`Returned ${asset.code} from ${job.job_no}${damaged?' as damaged':''}`,'warehouse')
-    await loadAll(); flash(`${asset.code} returned`); return asset
+    await loadAll(); flash(`${asset.code} returned`); return {asset, substitutedFrom:null, row}
   }
 
   async function setJobWarehouseStatus(jobId,status){
     const job=data.jobs.find(j=>j.id===jobId); if(!job) throw new Error('Job not found.')
+    const rows=data.jobAssets.filter(r=>r.job_id===jobId)
+    if(status==='Out'){
+      if(!rows.length) throw new Error('This job has no planned assets.')
+      const missing=rows.filter(r=>!r.out_at||r.returned_at)
+      if(missing.length){
+        const summary=missing.reduce((acc,r)=>{const a=data.assets.find(x=>x.id===r.asset_id);const key=a?.category||'Unknown';acc[key]=(acc[key]||0)+1;return acc},{})
+        throw new Error(`Cannot dispatch. Still missing: ${Object.entries(summary).map(([k,v])=>`${v} ${k}`).join(', ')}.`)
+      }
+    }
     const {error}=await supabase.from('jobs').update({status}).eq('id',jobId);if(error)throw error
     await log(`${job.job_no} marked ${status}`,'warehouse');await loadAll();flash(`Job marked ${status}`)
   }
