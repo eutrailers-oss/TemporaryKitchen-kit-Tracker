@@ -11,8 +11,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "@zxing/browser": "^0.1.5"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
