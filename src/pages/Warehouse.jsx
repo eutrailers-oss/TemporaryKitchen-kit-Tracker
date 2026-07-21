@@ -3,55 +3,64 @@ import { formatDate } from '../lib/utils'
 
 function CameraScanner({ active, onScan, onClose }) {
   const videoRef=useRef(null)
-  const streamRef=useRef(null)
-  const detectorRef=useRef(null)
-  const frameRef=useRef(null)
+  const controlsRef=useRef(null)
   const lastRef=useRef({value:'',at:0})
   const onScanRef=useRef(onScan)
   const [error,setError]=useState('')
+  const [starting,setStarting]=useState(false)
 
   useEffect(()=>{onScanRef.current=onScan},[onScan])
   useEffect(()=>{
     if(!active) return
     let cancelled=false
+    setError('')
+    setStarting(true)
+
     async function start(){
       try{
-        if(!('BarcodeDetector' in window)) throw new Error('Camera scanning is not supported by this browser. Use Chrome on Android, or type the asset code manually.')
-        detectorRef.current=new window.BarcodeDetector({formats:['qr_code','code_128','code_39','ean_13','ean_8','upc_a','upc_e']})
-        const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false})
-        if(cancelled){stream.getTracks().forEach(t=>t.stop());return}
-        streamRef.current=stream
-        videoRef.current.srcObject=stream
-        await videoRef.current.play()
-        scanFrame()
-      }catch(e){setError(e.message||'Unable to open the camera.')}
+        if(!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access is not available in this browser.')
+        const {BrowserMultiFormatReader}=await import('@zxing/browser')
+        if(cancelled) return
+        const reader=new BrowserMultiFormatReader()
+        controlsRef.current=await reader.decodeFromConstraints(
+          {video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false},
+          videoRef.current,
+          (result,scanError)=>{
+            if(cancelled||!result) return
+            const value=result.getText()?.trim()
+            const now=Date.now()
+            if(value&&(lastRef.current.value!==value||now-lastRef.current.at>2500)){
+              lastRef.current={value,at:now}
+              navigator.vibrate?.(120)
+              onScanRef.current(value)
+            }
+          }
+        )
+      }catch(e){
+        if(!cancelled) setError(e?.message||'Unable to open the camera. Check camera permission and try again.')
+      }finally{
+        if(!cancelled) setStarting(false)
+      }
     }
-    async function scanFrame(){
-      if(cancelled||!videoRef.current||!detectorRef.current) return
-      try{
-        const codes=await detectorRef.current.detect(videoRef.current)
-        const value=codes[0]?.rawValue?.trim()
-        const now=Date.now()
-        if(value&&(lastRef.current.value!==value||now-lastRef.current.at>2500)){
-          lastRef.current={value,at:now}
-          navigator.vibrate?.(120)
-          onScanRef.current(value)
-        }
-      }catch{}
-      frameRef.current=requestAnimationFrame(scanFrame)
-    }
+
     start()
     return ()=>{
       cancelled=true
-      if(frameRef.current) cancelAnimationFrame(frameRef.current)
-      streamRef.current?.getTracks().forEach(t=>t.stop())
+      controlsRef.current?.stop?.()
+      controlsRef.current=null
+      const stream=videoRef.current?.srcObject
+      stream?.getTracks?.().forEach(track=>track.stop())
     }
   },[active])
 
   if(!active) return null
   return <div className="scanner-card">
     <div className="scanner-head"><strong>Scan asset label</strong><button type="button" onClick={onClose}>Close camera</button></div>
-    {error?<div className="scan-message warn">{error}</div>:<><video ref={videoRef} muted playsInline/><div className="scanner-guide"><span></span></div><p>Hold the QR code or barcode inside the frame. Successful scans are recorded automatically.</p></>}
+    {error?<div className="scan-message warn">{error}<br/><small>You can still type the asset code below.</small></div>:<>
+      <video ref={videoRef} muted playsInline/>
+      <div className="scanner-guide"><span></span></div>
+      <p>{starting?'Opening camera…':'Hold the QR code or barcode inside the frame. Each successful scan is recorded automatically.'}</p>
+    </>}
   </div>
 }
 
