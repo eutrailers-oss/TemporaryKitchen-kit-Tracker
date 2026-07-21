@@ -21,6 +21,7 @@ function Textarea({label,...props}) { return <Field label={label}><textarea {...
 export default function App() {
   const [session, setSession] = useState(null)
   const [authReady, setAuthReady] = useState(false)
+  const [authView, setAuthView] = useState(() => window.location.pathname === '/update-password' ? 'recovery' : 'login')
   const [page, setPage] = useState('dashboard')
   const [data, setData] = useState(emptyData)
   const [loading, setLoading] = useState(false)
@@ -29,8 +30,14 @@ export default function App() {
 
   useEffect(()=>{
     if (!supabase) { setAuthReady(true); return }
-    supabase.auth.getSession().then(({data})=>{setSession(data.session);setAuthReady(true)})
-    const {data:sub}=supabase.auth.onAuthStateChange((_e,s)=>setSession(s))
+    supabase.auth.getSession().then(({data})=>{
+      setSession(data.session)
+      setAuthReady(true)
+    })
+    const {data:sub}=supabase.auth.onAuthStateChange((event,s)=>{
+      setSession(s)
+      if(event==='PASSWORD_RECOVERY') setAuthView('recovery')
+    })
     return ()=>sub.subscription.unsubscribe()
   },[])
   useEffect(()=>{ if(session) loadAll() },[session])
@@ -124,37 +131,69 @@ export default function App() {
   }
 
   async function scanAsset({jobId, code, mode, condition='Good', notes=''}) {
-    const clean=String(code||'').trim().toUpperCase()
+    const raw=String(code||'').trim()
+    let clean=raw.toUpperCase()
+    try {
+      const scannedUrl=new URL(raw)
+      clean=(scannedUrl.searchParams.get('code')||scannedUrl.searchParams.get('asset')||raw).trim().toUpperCase()
+    } catch {}
     if(!jobId) throw new Error('Select a job first.')
     if(!clean) throw new Error('Scan or enter an asset code.')
-    const asset=data.assets.find(a=>String(a.code||'').toUpperCase()===clean||String(a.old_code||'').toUpperCase()===clean)
+    const asset=data.assets.find(a=>String(a.code||'').toUpperCase()===clean||String(a.old_code||'').toUpperCase()===clean||String(a.id||'').toUpperCase()===clean)
     if(!asset) throw new Error(`Asset ${clean} was not found.`)
     const job=data.jobs.find(j=>j.id===jobId)
     if(!job) throw new Error('Job was not found.')
-    const row=data.jobAssets.find(x=>x.job_id===jobId&&x.asset_id===asset.id)
+    const rows=data.jobAssets.filter(x=>x.job_id===jobId)
+    const row=rows.find(x=>x.asset_id===asset.id)
+
     if(mode==='load') {
+      if(asset.condition!=='Good'||['In Repair','Lost','Retired'].includes(asset.status)) throw new Error(`${asset.code} is ${asset.condition||asset.status} and cannot be loaded.`)
       const other=data.jobAssets.find(x=>x.asset_id===asset.id&&x.job_id!==jobId&&x.out_at&&!x.returned_at)
       if(other){const otherJob=data.jobs.find(j=>j.id===other.job_id);throw new Error(`${asset.code} is already out on ${otherJob?.job_no||'another job'}.`)}
       if(row?.out_at&&!row?.returned_at) throw new Error(`${asset.code} is already loaded on this job.`)
+
       const now=new Date().toISOString()
-      if(row){const {error}=await supabase.from('job_assets').update({out_at:now,returned_at:null,return_condition:null,notes:notes||row.notes||null}).eq('id',row.id);if(error)throw error}
-      else {const {error}=await supabase.from('job_assets').insert({job_id:jobId,asset_id:asset.id,out_at:now,notes:notes||null});if(error)throw error}
+      let action='loaded'
+      let replacedAsset=null
+      if(row){
+        const {error}=await supabase.from('job_assets').update({out_at:now,returned_at:null,return_condition:null,notes:notes||row.notes||null}).eq('id',row.id);if(error)throw error
+      } else if(rows.length) {
+        const category=String(asset.category||'').trim().toLowerCase()
+        const substituteRow=rows.find(r=>{
+          if(r.out_at&&!r.returned_at) return false
+          const planned=data.assets.find(a=>a.id===r.asset_id)
+          return String(planned?.category||'').trim().toLowerCase()===category
+        })
+        if(!substituteRow) {
+          const required=[...new Set(rows.map(r=>data.assets.find(a=>a.id===r.asset_id)?.category).filter(Boolean))]
+          throw new Error(`${asset.code} is the wrong item for this job. Required types: ${required.join(', ')||'none'}.`)
+        }
+        replacedAsset=data.assets.find(a=>a.id===substituteRow.asset_id)||null
+        const {error}=await supabase.from('job_assets').update({asset_id:asset.id,out_at:now,returned_at:null,return_condition:null,notes:notes||substituteRow.notes||null}).eq('id',substituteRow.id);if(error)throw error
+        action='substituted'
+      } else {
+        const {error}=await supabase.from('job_assets').insert({job_id:jobId,asset_id:asset.id,out_at:now,notes:notes||null});if(error)throw error
+      }
       const {error:assetError}=await supabase.from('assets').update({status:'On Hire'}).eq('id',asset.id);if(assetError)throw assetError
-      await log(`Loaded ${asset.code} onto ${job.job_no}`,'warehouse')
-      await loadAll(); flash(`${asset.code} loaded`); return asset
+      await log(action==='substituted'?`Substituted ${replacedAsset?.code||'planned asset'} with ${asset.code} on ${job.job_no}`:`Loaded ${asset.code} onto ${job.job_no}`,'warehouse')
+      await loadAll(); flash(action==='substituted'?`${asset.code} substituted and loaded`:`${asset.code} loaded`); return {asset,action,replacedAsset}
     }
+
     if(!row||!row.out_at||row.returned_at) throw new Error(`${asset.code} is not currently out on this job.`)
     const now=new Date().toISOString()
     const {error}=await supabase.from('job_assets').update({returned_at:now,return_condition:condition,notes:notes||row.notes||null}).eq('id',row.id);if(error)throw error
     const damaged=condition==='Damaged'
-    const {error:assetError}=await supabase.from('assets').update({status:damaged?'Unavailable':'Available',condition:damaged?'Damaged':'Good'}).eq('id',asset.id);if(assetError)throw assetError
+    const {error:assetError}=await supabase.from('assets').update({status:damaged?'In Repair':'Available',condition:damaged?'Damaged':'Good'}).eq('id',asset.id);if(assetError)throw assetError
     if(damaged){const {error:damageError}=await supabase.from('damage_logs').insert({asset_id:asset.id,job_id:jobId,reported_date:isoDate(),reported_by:session?.user?.email||null,severity:'Medium',status:'Open',notes:notes||'Damage recorded during return'});if(damageError)throw damageError}
     await log(`Returned ${asset.code} from ${job.job_no}${damaged?' as damaged':''}`,'warehouse')
-    await loadAll(); flash(`${asset.code} returned`); return asset
+    await loadAll(); flash(`${asset.code} returned`); return {asset,action:'returned'}
   }
 
   async function setJobWarehouseStatus(jobId,status){
     const job=data.jobs.find(j=>j.id===jobId); if(!job) throw new Error('Job not found.')
+    const rows=data.jobAssets.filter(x=>x.job_id===jobId)
+    if(status==='Out'&&(!rows.length||rows.some(x=>!x.out_at||x.returned_at))) throw new Error('The full kit must be loaded before dispatch.')
+    if(status==='Returned'&&rows.some(x=>x.out_at&&!x.returned_at)) throw new Error('Return every loaded asset before marking the job returned.')
     const {error}=await supabase.from('jobs').update({status}).eq('id',jobId);if(error)throw error
     await log(`${job.job_no} marked ${status}`,'warehouse');await loadAll();flash(`Job marked ${status}`)
   }
@@ -170,6 +209,7 @@ export default function App() {
 
   if(!hasSupabaseConfig) return <div className="center-card"><h1>Kitchen Kit Tracker</h1><p>Supabase environment variables are missing.</p><code>VITE_SUPABASE_URL<br/>VITE_SUPABASE_ANON_KEY</code></div>
   if(!authReady) return <div className="loading">Loading…</div>
+  if(authView==='recovery') return <UpdatePassword session={session} onComplete={()=>{ history.replaceState({},'', '/'); setAuthView('login') }} onCancel={()=>{ history.replaceState({},'', '/'); setAuthView('login') }} />
   if(!session) return <Login />
 
   const pageProps={data,openJob,openAsset,openCustomer,openDamage,setPage,importAssets,refresh:loadAll,scanAsset,setJobWarehouseStatus}
@@ -182,9 +222,68 @@ export default function App() {
 }
 
 function Login(){
-  const [email,setEmail]=useState('');const [password,setPassword]=useState('');const [error,setError]=useState('');const [busy,setBusy]=useState(false)
-  async function submit(e){e.preventDefault();setBusy(true);setError('');const {error}=await supabase.auth.signInWithPassword({email,password});if(error)setError(error.message);setBusy(false)}
-  return <div className="login-page"><form className="login-card" onSubmit={submit}><div className="brand-mark large">KK</div><h1>Kitchen Kit Tracker</h1><p>Sign in to the shared hire system.</p>{error&&<div className="form-error">{error}</div>}<Input label="Email" type="email" value={email} onChange={e=>setEmail(e.target.value)} required/><Input label="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} required/><button className="primary wide" disabled={busy}>{busy?'Signing in…':'Sign in'}</button></form></div>
+  const [mode,setMode]=useState('login')
+  const [email,setEmail]=useState('')
+  const [password,setPassword]=useState('')
+  const [error,setError]=useState('')
+  const [message,setMessage]=useState('')
+  const [busy,setBusy]=useState(false)
+
+  async function submit(e){
+    e.preventDefault()
+    setBusy(true);setError('');setMessage('')
+    if(mode==='recovery'){
+      const {error}=await supabase.auth.resetPasswordForEmail(email.trim(),{redirectTo:`${window.location.origin}/update-password`})
+      if(error)setError(error.message)
+      else setMessage('Password reset email sent. Open the link in that email to create a new password.')
+    }else{
+      const {error}=await supabase.auth.signInWithPassword({email:email.trim(),password})
+      if(error)setError(error.message)
+    }
+    setBusy(false)
+  }
+
+  return <div className="login-page"><form className="login-card" onSubmit={submit}>
+    <div className="brand-mark large">TK</div>
+    <h1>Temporary Kitchens</h1>
+    <p>{mode==='recovery'?'Reset your Kit Tracker password.':'Sign in to Kit Tracker.'}</p>
+    {error&&<div className="form-error">{error}</div>}
+    {message&&<div className="form-success">{message}</div>}
+    <Input label="Email" type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} required/>
+    {mode==='login'&&<Input label="Password" type="password" autoComplete="current-password" value={password} onChange={e=>setPassword(e.target.value)} required/>}
+    <button className="primary wide" disabled={busy}>{busy?(mode==='recovery'?'Sending…':'Signing in…'):(mode==='recovery'?'Send password reset email':'Sign in')}</button>
+    <button className="link-button wide" type="button" onClick={()=>{setMode(mode==='login'?'recovery':'login');setError('');setMessage('')}}>{mode==='login'?'Forgot password?':'Back to sign in'}</button>
+  </form></div>
+}
+
+function UpdatePassword({session,onComplete,onCancel}){
+  const [password,setPassword]=useState('')
+  const [confirm,setConfirm]=useState('')
+  const [error,setError]=useState('')
+  const [busy,setBusy]=useState(false)
+
+  async function submit(e){
+    e.preventDefault();setError('')
+    if(!session){setError('This password reset link is invalid or has expired. Request a new reset email.');return}
+    if(password.length<8){setError('Use at least 8 characters.');return}
+    if(password!==confirm){setError('The passwords do not match.');return}
+    setBusy(true)
+    const {error}=await supabase.auth.updateUser({password})
+    setBusy(false)
+    if(error){setError(error.message);return}
+    onComplete()
+  }
+
+  return <div className="login-page"><form className="login-card" onSubmit={submit}>
+    <div className="brand-mark large">TK</div>
+    <h1>Create new password</h1>
+    <p>Choose a new password for your Temporary Kitchens account.</p>
+    {error&&<div className="form-error">{error}</div>}
+    <Input label="New password" type="password" autoComplete="new-password" value={password} onChange={e=>setPassword(e.target.value)} required/>
+    <Input label="Confirm password" type="password" autoComplete="new-password" value={confirm} onChange={e=>setConfirm(e.target.value)} required/>
+    <button className="primary wide" disabled={busy||!session}>{busy?'Saving…':'Save new password'}</button>
+    <button className="link-button wide" type="button" onClick={onCancel}>Back to sign in</button>
+  </form></div>
 }
 
 function EditorModal({modal,setModal,data,saveCustomer,saveAsset,saveJob,saveDamage,isAssetFree}){
