@@ -21,6 +21,7 @@ function Textarea({label,...props}) { return <Field label={label}><textarea {...
 export default function App() {
   const [session, setSession] = useState(null)
   const [authReady, setAuthReady] = useState(false)
+  const [authView, setAuthView] = useState(() => window.location.pathname === '/update-password' ? 'recovery' : 'login')
   const [page, setPage] = useState('dashboard')
   const [data, setData] = useState(emptyData)
   const [loading, setLoading] = useState(false)
@@ -29,8 +30,14 @@ export default function App() {
 
   useEffect(()=>{
     if (!supabase) { setAuthReady(true); return }
-    supabase.auth.getSession().then(({data})=>{setSession(data.session);setAuthReady(true)})
-    const {data:sub}=supabase.auth.onAuthStateChange((_e,s)=>setSession(s))
+    supabase.auth.getSession().then(({data})=>{
+      setSession(data.session)
+      setAuthReady(true)
+    })
+    const {data:sub}=supabase.auth.onAuthStateChange((event,s)=>{
+      setSession(s)
+      if(event==='PASSWORD_RECOVERY') setAuthView('recovery')
+    })
     return ()=>sub.subscription.unsubscribe()
   },[])
   useEffect(()=>{ if(session) loadAll() },[session])
@@ -202,6 +209,7 @@ export default function App() {
 
   if(!hasSupabaseConfig) return <div className="center-card"><h1>Kitchen Kit Tracker</h1><p>Supabase environment variables are missing.</p><code>VITE_SUPABASE_URL<br/>VITE_SUPABASE_ANON_KEY</code></div>
   if(!authReady) return <div className="loading">Loading…</div>
+  if(authView==='recovery') return <UpdatePassword session={session} onComplete={()=>{ history.replaceState({},'', '/'); setAuthView('login') }} onCancel={()=>{ history.replaceState({},'', '/'); setAuthView('login') }} />
   if(!session) return <Login />
 
   const pageProps={data,openJob,openAsset,openCustomer,openDamage,setPage,importAssets,refresh:loadAll,scanAsset,setJobWarehouseStatus}
@@ -214,9 +222,68 @@ export default function App() {
 }
 
 function Login(){
-  const [email,setEmail]=useState('');const [password,setPassword]=useState('');const [error,setError]=useState('');const [busy,setBusy]=useState(false)
-  async function submit(e){e.preventDefault();setBusy(true);setError('');const {error}=await supabase.auth.signInWithPassword({email,password});if(error)setError(error.message);setBusy(false)}
-  return <div className="login-page"><form className="login-card" onSubmit={submit}><div className="brand-mark large">KK</div><h1>Kitchen Kit Tracker</h1><p>Sign in to the shared hire system.</p>{error&&<div className="form-error">{error}</div>}<Input label="Email" type="email" value={email} onChange={e=>setEmail(e.target.value)} required/><Input label="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} required/><button className="primary wide" disabled={busy}>{busy?'Signing in…':'Sign in'}</button></form></div>
+  const [mode,setMode]=useState('login')
+  const [email,setEmail]=useState('')
+  const [password,setPassword]=useState('')
+  const [error,setError]=useState('')
+  const [message,setMessage]=useState('')
+  const [busy,setBusy]=useState(false)
+
+  async function submit(e){
+    e.preventDefault()
+    setBusy(true);setError('');setMessage('')
+    if(mode==='recovery'){
+      const {error}=await supabase.auth.resetPasswordForEmail(email.trim(),{redirectTo:`${window.location.origin}/update-password`})
+      if(error)setError(error.message)
+      else setMessage('Password reset email sent. Open the link in that email to create a new password.')
+    }else{
+      const {error}=await supabase.auth.signInWithPassword({email:email.trim(),password})
+      if(error)setError(error.message)
+    }
+    setBusy(false)
+  }
+
+  return <div className="login-page"><form className="login-card" onSubmit={submit}>
+    <div className="brand-mark large">TK</div>
+    <h1>Temporary Kitchens</h1>
+    <p>{mode==='recovery'?'Reset your Kit Tracker password.':'Sign in to Kit Tracker.'}</p>
+    {error&&<div className="form-error">{error}</div>}
+    {message&&<div className="form-success">{message}</div>}
+    <Input label="Email" type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} required/>
+    {mode==='login'&&<Input label="Password" type="password" autoComplete="current-password" value={password} onChange={e=>setPassword(e.target.value)} required/>}
+    <button className="primary wide" disabled={busy}>{busy?(mode==='recovery'?'Sending…':'Signing in…'):(mode==='recovery'?'Send password reset email':'Sign in')}</button>
+    <button className="link-button wide" type="button" onClick={()=>{setMode(mode==='login'?'recovery':'login');setError('');setMessage('')}}>{mode==='login'?'Forgot password?':'Back to sign in'}</button>
+  </form></div>
+}
+
+function UpdatePassword({session,onComplete,onCancel}){
+  const [password,setPassword]=useState('')
+  const [confirm,setConfirm]=useState('')
+  const [error,setError]=useState('')
+  const [busy,setBusy]=useState(false)
+
+  async function submit(e){
+    e.preventDefault();setError('')
+    if(!session){setError('This password reset link is invalid or has expired. Request a new reset email.');return}
+    if(password.length<8){setError('Use at least 8 characters.');return}
+    if(password!==confirm){setError('The passwords do not match.');return}
+    setBusy(true)
+    const {error}=await supabase.auth.updateUser({password})
+    setBusy(false)
+    if(error){setError(error.message);return}
+    onComplete()
+  }
+
+  return <div className="login-page"><form className="login-card" onSubmit={submit}>
+    <div className="brand-mark large">TK</div>
+    <h1>Create new password</h1>
+    <p>Choose a new password for your Temporary Kitchens account.</p>
+    {error&&<div className="form-error">{error}</div>}
+    <Input label="New password" type="password" autoComplete="new-password" value={password} onChange={e=>setPassword(e.target.value)} required/>
+    <Input label="Confirm password" type="password" autoComplete="new-password" value={confirm} onChange={e=>setConfirm(e.target.value)} required/>
+    <button className="primary wide" disabled={busy||!session}>{busy?'Saving…':'Save new password'}</button>
+    <button className="link-button wide" type="button" onClick={onCancel}>Back to sign in</button>
+  </form></div>
 }
 
 function EditorModal({modal,setModal,data,saveCustomer,saveAsset,saveJob,saveDamage,isAssetFree}){
